@@ -277,13 +277,13 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # Build query in BNSD layout
         qsl = attn_metadata.query_start_loc  # (B + 1,) tensor
         if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-            q_bnsd = query[:B].view(B, Hq, 1, D)
+            q_bnsd = query[:B].view(B, Hq, 1, D).to(torch.float16)
             actual_seq_qlen = [1] * B
         else:
             q_lens = (qsl[1:] - qsl[:-1]).tolist()
             max_q_len = max(q_lens) if q_lens else 1
             q_bnsd = torch.zeros(
-                B, Hq, max_q_len, D, dtype=query.dtype, device=query.device
+                B, Hq, max_q_len, D, dtype=torch.float16, device=query.device
             )
             for i, ql in enumerate(q_lens):
                 q_start = int(qsl[i].item())
