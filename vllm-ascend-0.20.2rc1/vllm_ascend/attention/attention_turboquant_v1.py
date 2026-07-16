@@ -286,7 +286,8 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             )
             for i, ql in enumerate(q_lens):
                 q_start = int(qsl[i].item())
-                q_bnsd[i, :, :ql, :] = query[q_start : q_start + ql]
+                # query[q_start:q_start+ql] is (ql, Hq, D), need (Hq, ql, D)
+                q_bnsd[i, :, :ql, :] = query[q_start : q_start + ql].transpose(0, 1)
             actual_seq_qlen = q_lens
 
         # FIA call with BNSD layout, dense float K/V
@@ -325,7 +326,8 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             )
             idx = 0
             for i, ql in enumerate(q_lens):
-                flat_output[idx : idx + ql] = attn_output[i, :, :ql, :].reshape(
+                # attn_output[i, :, :ql, :] is (Hq, ql, D), need (ql, Hq*D)
+                flat_output[idx : idx + ql] = attn_output[i, :, :ql, :].permute(1, 0, 2).reshape(
                     ql, Hq * D
                 )
                 idx += ql
