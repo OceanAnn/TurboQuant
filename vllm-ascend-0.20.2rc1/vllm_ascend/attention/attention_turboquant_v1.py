@@ -156,17 +156,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
 
         self._ensure_tq_init()
 
-        if not getattr(self, "_tq_logged", False):
-            self._tq_logged = True
-            print(
-                f"[TQ] AscendTurboQuantAttentionBackendImpl.forward called "
-                f"on layer {getattr(layer, 'layer_name', '?')}, "
-                f"head_size={self.head_size}, "
-                f"kv_cache_dtype={self.kv_cache_dtype}, "
-                f"impl_class={type(self).__name__}",
-                flush=True,
-            )
-
         N = attn_metadata.num_actual_tokens
         if N <= 0:
             return output.fill_(0)
@@ -178,16 +167,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
 
         # Store K/V into TQ cache (Algorithm 1: Quant_mse)
         if key is not None and value is not None and tq_cache is not None:
-            if not getattr(self, "_tq_store_logged", False):
-                self._tq_store_logged = True
-                print(
-                    f"[TQ] store_turboquant_kv called: "
-                    f"kv_cache shape={tq_cache.shape}, dtype={tq_cache.dtype}, "
-                    f"slot_size={tq_cache.shape[-1]}, "
-                    f"Pi shape={layer._tq_Pi.shape}, "
-                    f"centroids shape={layer._tq_centroids.shape}",
-                    flush=True,
-                )
             store_turboquant_kv(
                 key=key[:N].view(N, self.num_kv_heads, self.head_size),
                 value=value[:N].view(N, self.num_kv_heads, self.head_size),

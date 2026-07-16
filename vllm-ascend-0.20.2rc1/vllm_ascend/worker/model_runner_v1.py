@@ -3943,14 +3943,6 @@ class NPUModelRunner(GPUModelRunner):
                     elif isinstance(current_kv_cache_spec, TQFullAttentionSpec):
                         # TurboQuant: single 4D uint8 tensor
                         # (num_blocks, block_size, Hk, slot_size)
-                        if not getattr(self, "_tq_reshape_logged", False):
-                            self._tq_reshape_logged = True
-                            print(
-                                f"[TQ] reshape branch hit: layer={layer_name}, "
-                                f"spec_type={type(current_kv_cache_spec).__name__}, "
-                                f"tq_slot_size={current_kv_cache_spec.tq_slot_size}",
-                                flush=True,
-                            )
                         raw_tensor = kv_cache_raw_tensors[layer_name]
                         assert raw_tensor is not None
                         tq_slot_size = current_kv_cache_spec.tq_slot_size
@@ -3972,20 +3964,6 @@ class NPUModelRunner(GPUModelRunner):
                         kv_caches[layer_name] = k_cache
                         continue
                     else:
-                        if not getattr(self, "_tq_else_logged", False):
-                            self._tq_else_logged = True
-                            print(
-                                f"[TQ-DEBUG] fell through to standard k/v branch: "
-                                f"layer={layer_name}, "
-                                f"spec_type={type(current_kv_cache_spec).__name__}, "
-                                f"is_TQ={isinstance(current_kv_cache_spec, TQFullAttentionSpec)}, "
-                                f"has_tq_slot={hasattr(current_kv_cache_spec, 'tq_slot_size')}, "
-                                f"tq_slot_val={getattr(current_kv_cache_spec, 'tq_slot_size', 'N/A')}, "
-                                f"use_hybrid={self.use_hybrid_blocks}, "
-                                f"hybrid_mamba={self.hybrid_with_attn_and_mamba}, "
-                                f"use_sparse={self.use_sparse}",
-                                flush=True,
-                            )
                         raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[  # type: ignore
                             layer_name
                         ]
