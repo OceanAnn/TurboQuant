@@ -150,7 +150,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             kv_cache: single (num_blocks, block_size, Hk, slot_size) uint8
         """
         assert output is not None, "Output tensor must be provided."
-        num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -193,7 +192,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 query[:N], tq_cache, attn_metadata, output, layer
             )
 
-        output[:num_tokens] = attn_output[:num_tokens]
+        output[:N] = attn_output[:N]
         return output
 
     def _forward_tq_prefill(
