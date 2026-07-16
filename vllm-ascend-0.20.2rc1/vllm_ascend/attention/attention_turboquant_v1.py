@@ -30,6 +30,7 @@ Subclasses AscendAttentionBackendImpl to handle TQ's combined
 single-tensor paged uint8 cache.
 """
 
+import math
 from typing import Any
 
 import torch
@@ -260,18 +261,35 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         D = self.head_size
         num_tokens = query.shape[0]
 
-        # Dequant paged TQ cache to dense float16 K/V
+        # Allocate dequant buffers at max_num_seqs capacity (one-time).
+        # At runtime we slice to current B — no reallocation, no perf hit.
+        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        max_seq_len = self.vllm_config.model_config.max_model_len
+        block_size = tq_cache.shape[1]
+        max_alloc_len = math.ceil(max_seq_len / block_size) * block_size
+
+        if not hasattr(layer, "_tq_k_dequant_buf") or \
+           layer._tq_k_dequant_buf.shape[0] < max_num_seqs or \
+           layer._tq_k_dequant_buf.shape[2] < max_alloc_len:
+            layer._tq_k_dequant_buf = torch.empty(
+                max_num_seqs, Hk, max_alloc_len, D,
+                dtype=torch.float16, device=query.device,
+            )
+            layer._tq_v_dequant_buf = torch.empty(
+                max_num_seqs, Hk, max_alloc_len, D,
+                dtype=torch.float16, device=query.device,
+            )
+
+        # Dequant paged TQ cache to dense float16 K/V (sliced to current B)
         k_dense, v_dense, alloc_len = dequant_paged_kv(
             kv_cache=tq_cache,
             block_table=attn_metadata.block_tables,
             seq_lens=attn_metadata.seq_lens,
             Pi=layer._tq_Pi,
             centroids=layer._tq_centroids,
-            k_buf=getattr(layer, "_tq_k_dequant_buf", None),
-            v_buf=getattr(layer, "_tq_v_dequant_buf", None),
+            k_buf=layer._tq_k_dequant_buf,
+            v_buf=layer._tq_v_dequant_buf,
         )
-        layer._tq_k_dequant_buf = k_dense
-        layer._tq_v_dequant_buf = v_dense
 
         # Build query in BNSD layout
         qsl = attn_metadata.query_start_loc  # (B + 1,) tensor

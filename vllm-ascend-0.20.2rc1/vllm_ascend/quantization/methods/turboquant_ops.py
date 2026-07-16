@@ -329,10 +329,14 @@ def dequant_paged_kv(
     max_seq_len = int(seq_lens.max().item())
     alloc_len = math.ceil(max_seq_len / block_size) * block_size
 
-    if k_buf is None or k_buf.shape[0] != B or k_buf.shape[2] < alloc_len:
+    if k_buf is None or k_buf.shape[0] < B or k_buf.shape[2] < alloc_len:
         k_buf = torch.empty(B, Hk, alloc_len, D, dtype=torch.float16, device=device)
-    if v_buf is None or v_buf.shape[0] != B or v_buf.shape[2] < alloc_len:
+    if v_buf is None or v_buf.shape[0] < B or v_buf.shape[2] < alloc_len:
         v_buf = torch.empty(B, Hk, alloc_len, D, dtype=torch.float16, device=device)
+
+    # Slice to current B (buffer may be larger — allocated at max_num_seqs)
+    k_buf = k_buf[:B, :, :alloc_len, :]
+    v_buf = v_buf[:B, :, :alloc_len, :]
 
     mse_bytes = math.ceil(D * MSE_BITS / 8)
     per_vector = mse_bytes + 2
@@ -352,7 +356,7 @@ def dequant_paged_kv(
     v_recon = _dequant_single_vector(slot_flat, Pi, centroids, D, offset=per_vector)
 
     # Reshape: (B, alloc_len, Hk, D) -> (B, Hk, alloc_len, D)
-    k_buf[:, :, :alloc_len, :] = k_recon.to(torch.float16).reshape(B, alloc_len, Hk, D).permute(0, 2, 1, 3)
-    v_buf[:, :, :alloc_len, :] = v_recon.to(torch.float16).reshape(B, alloc_len, Hk, D).permute(0, 2, 1, 3)
+    k_buf[:] = k_recon.to(torch.float16).reshape(B, alloc_len, Hk, D).permute(0, 2, 1, 3)
+    v_buf[:] = v_recon.to(torch.float16).reshape(B, alloc_len, Hk, D).permute(0, 2, 1, 3)
 
     return k_buf, v_buf, alloc_len
