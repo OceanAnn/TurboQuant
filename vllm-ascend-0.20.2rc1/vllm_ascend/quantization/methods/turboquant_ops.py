@@ -329,9 +329,9 @@ def dequant_paged_kv(
     max_seq_len = int(seq_lens.max().item())
     alloc_len = math.ceil(max_seq_len / block_size) * block_size
 
-    if k_buf is None or k_buf.shape[0] < B or k_buf.shape[2] < alloc_len:
+    if k_buf is None or k_buf.shape[0] != B or k_buf.shape[2] < alloc_len:
         k_buf = torch.empty(B, Hk, alloc_len, D, dtype=torch.float16, device=device)
-    if v_buf is None or v_buf.shape[0] < B or v_buf.shape[2] < alloc_len:
+    if v_buf is None or v_buf.shape[0] != B or v_buf.shape[2] < alloc_len:
         v_buf = torch.empty(B, Hk, alloc_len, D, dtype=torch.float16, device=device)
 
     mse_bytes = math.ceil(D * MSE_BITS / 8)
