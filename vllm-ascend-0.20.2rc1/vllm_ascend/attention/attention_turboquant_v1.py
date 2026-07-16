@@ -291,17 +291,26 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             actual_seq_qlen = q_lens
 
         # FIA call with BNSD layout, dense float K/V
-        if self.sliding_window is not None:
+        is_decode = attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        if is_decode:
+            # Decode: no mask needed, each query attends to all its KV
+            sparse_mode = 0
+            pre_tokens = SWA_INT_MAX
+            atten_mask = None
+        elif self.sliding_window is not None:
             sparse_mode = 4
             pre_tokens = self.sliding_window
+            atten_mask = attn_metadata.attn_mask
         else:
             sparse_mode = 3
             pre_tokens = SWA_INT_MAX
+            atten_mask = attn_metadata.attn_mask
 
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query=q_bnsd,
             key=k_dense,
             value=v_dense,
+            atten_mask=atten_mask,
             input_layout="BNSD",
             actual_seq_lengths=actual_seq_qlen,
             actual_seq_lengths_kv=attn_metadata.seq_lens_list,
