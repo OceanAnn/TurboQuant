@@ -30,7 +30,6 @@ Subclasses AscendAttentionBackendImpl to handle TQ's combined
 single-tensor paged uint8 cache.
 """
 
-import math
 from typing import Any
 
 import torch
@@ -105,15 +104,13 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         """One-time derivation of TQ buffers.
 
         Creates the random rotation matrix Π (via QR decomposition),
-        shared across all layers. Also computes midpoints from centroids
-        and pre-allocates dequant buffers at max_num_seqs capacity.
+        shared across all layers. Also computes midpoints from centroids.
 
         Paper Algorithm 1 line 2:
           - Generate a random rotation matrix Π
         """
         if not hasattr(layer, "_tq_cached"):
             D = self.head_size
-            Hk = self.num_kv_heads
 
             # Random rotation matrix (paper: QR decomposition of Gaussian matrix)
             layer._tq_Pi = build_random_rotation(D, device)
@@ -121,21 +118,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             # Compute midpoints from centroids
             c = layer._tq_centroids.to(device=device, dtype=torch.float32)
             layer._tq_midpoints = compute_midpoints(c)
-
-            # Pre-allocate dequant buffers (one-time, sized for max_num_seqs)
-            max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-            max_seq_len = self.vllm_config.model_config.max_model_len
-            block_size = self.vllm_config.cache_config.block_size
-            max_alloc_len = math.ceil(max_seq_len / block_size) * block_size
-            layer._tq_k_dequant_buf = torch.empty(
-                max_num_seqs, Hk, max_alloc_len, D,
-                dtype=torch.float16, device=device,
-            )
-            layer._tq_v_dequant_buf = torch.empty(
-                max_num_seqs, Hk, max_alloc_len, D,
-                dtype=torch.float16, device=device,
-            )
-
             layer._tq_cached = True
 
     @staticmethod
@@ -278,17 +260,20 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         D = self.head_size
         num_tokens = query.shape[0]
 
-        # Dequant paged TQ cache to dense float16 K/V (buffers pre-allocated
-        # in _ensure_on_device, sliced to current B — zero alloc on hot path)
+        # Dequant paged TQ cache to dense float16 K/V.
+        # Buffers are lazily allocated and cached; dequant_paged_kv slices
+        # to current B (view, zero alloc on hot path when B doesn't change).
         k_dense, v_dense, alloc_len = dequant_paged_kv(
             kv_cache=tq_cache,
             block_table=attn_metadata.block_tables,
             seq_lens=attn_metadata.seq_lens,
             Pi=layer._tq_Pi,
             centroids=layer._tq_centroids,
-            k_buf=layer._tq_k_dequant_buf,
-            v_buf=layer._tq_v_dequant_buf,
+            k_buf=getattr(layer, "_tq_k_dequant_buf", None),
+            v_buf=getattr(layer, "_tq_v_dequant_buf", None),
         )
+        layer._tq_k_dequant_buf = k_dense
+        layer._tq_v_dequant_buf = v_dense
 
         # Build query in BNSD layout
         qsl = attn_metadata.query_start_loc  # (B + 1,) tensor
