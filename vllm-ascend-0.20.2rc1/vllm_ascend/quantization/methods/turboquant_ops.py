@@ -26,10 +26,9 @@ For INT4 (b=4 bits per coordinate):
   3. Lloyd-Max optimal scalar quantization: idx_j = argmin_k |y_j - c_k|  (4-bit)
   4. Store: packed 4-bit indices + vec_norm (fp16)
 
-Dequant:
-  1. Gather centroids: ỹ_j = c_{idx_j}
-  2. Inverse rotate: x̂ = Π^T · ỹ
-  3. Rescale: x = x̂ · ||x||
+Dequant (optimized):
+  1. Gather pre-rotated centroids: ỹ = Pi_centroids[idx]  (precomputed: centroids @ Π)
+  2. Rescale: x = ỹ · ||x||
 
 Both K and V are quantized with the same TurboQuant_mse algorithm.
 
@@ -58,26 +57,35 @@ def build_random_rotation(d: int, device: torch.device, seed: int = ROTATION_SEE
 
     Paper Section 3.1: "We can generate Π by applying QR decomposition on
     a random matrix with i.i.d Normal entries."
-
-    The resulting matrix is orthogonal with determinant +1 (proper rotation).
     """
     g = torch.Generator(device="cpu").manual_seed(seed)
     A = torch.randn(d, d, generator=g, dtype=torch.float32)
     Q, R = torch.linalg.qr(A)
-    # Ensure det(Π) = +1 (proper rotation, not reflection)
     sign = torch.sign(torch.diag(R))
     Q = Q * sign.unsqueeze(0)
     return Q.to(device)
 
 
 def compute_midpoints(centroids: torch.Tensor) -> torch.Tensor:
-    """Compute decision boundaries from sorted centroids.
-
-    Paper Section 3.1: "interval boundaries are the midpoints between
-    consecutive centroids, when arranged in sorted order."
-    """
+    """Compute decision boundaries from sorted centroids."""
     c_sorted, _ = centroids.sort()
     return (c_sorted[:-1] + c_sorted[1:]) / 2
+
+
+def compute_pi_centroids(centroids: torch.Tensor, Pi: torch.Tensor) -> torch.Tensor:
+    """Precompute inverse-rotated centroids: Pi_centroids = centroids @ Pi.
+
+    This eliminates the D×D matmul during dequant — instead of:
+        c = centroids[idx]        # (M, D) gather
+        x = c @ Pi                # (M, D) matmul — O(M * D^2)
+
+    We precompute once:
+        pi_c = centroids @ Pi     # (n_centroids, D) — O(n_centroids * D^2)
+
+    Then dequant is just:
+        x = pi_c[idx]             # (M, D) gather — O(M * D)
+    """
+    return (centroids.to(torch.float32) @ Pi).to(torch.float16)
 
 
 def compute_paper_slot_size(head_dim: int) -> int:
@@ -101,27 +109,14 @@ def compute_paper_slot_size(head_dim: int) -> int:
 
 
 def pack_4bit(indices: torch.Tensor) -> torch.Tensor:
-    """Pack int indices (0-15) into 4-bit packed bytes.
-
-    Args:
-        indices: (..., D) int32/int64, D must be even.
-    Returns:
-        (..., D // 2) uint8 — two values per byte, low nibble first.
-    """
+    """Pack int indices (0-15) into 4-bit packed bytes."""
     pairs = indices.reshape(*indices.shape[:-1], -1, 2)
     packed = (pairs[..., 0] & 0xF) | ((pairs[..., 1] & 0xF) << 4)
     return packed.to(torch.uint8)
 
 
 def unpack_4bit(packed: torch.Tensor, D: int) -> torch.Tensor:
-    """Unpack 4-bit indices from bytes.
-
-    Args:
-        packed: (..., D // 2) uint8.
-        D: original number of elements (must be even).
-    Returns:
-        (..., D) int32.
-    """
+    """Unpack 4-bit indices from bytes."""
     low = (packed & 0xF).to(torch.int32)
     high = ((packed >> 4) & 0xF).to(torch.int32)
     return torch.stack([low, high], dim=-1).reshape(*packed.shape[:-1], D)
@@ -163,29 +158,15 @@ def _quantize_single_vector(
     Paper Algorithm 1:
       y ← Π · x           (random rotation)
       idx_j ← argmin_k |y_j - c_k|  (Lloyd-Max nearest centroid)
-
-    Args:
-        x: (NH, D) float32 — input vectors (K or V).
-        Pi: (D, D) float32 — random rotation matrix.
-        centroids: (n_centroids,) float32 — Lloyd-Max centroids.
-        midpoints: (n_centroids-1,) float32 — decision boundaries.
-        D: head dimension.
-
-    Returns:
-        slot_data: (NH, per_vector_bytes) uint8 — packed quantized data.
     """
     # ── Step 1: Normalize to unit sphere ───────────────────────────
-    # Paper assumes x ∈ S^{d-1}; real KV vectors are not unit, so store ||x||
     norms = x.norm(dim=1, keepdim=True)  # (NH, 1)
     x_hat = x / (norms + 1e-8)
 
     # ── Step 2: Random rotation: y = Π · x̂ ─────────────────────────
-    # Paper line 5: y ← Π · x
-    # For batch: Y = X_hat @ Π^T
     y = x_hat @ Pi.T  # (NH, D)
 
     # ── Step 3: Lloyd-Max quantize (4-bit) ─────────────────────────
-    # Paper line 6: idx_j ← argmin_k |y_j - c_k|
     indices = torch.bucketize(y, midpoints)  # (NH, D)
     indices = indices.clamp(0, centroids.shape[0] - 1).to(torch.int32)
 
@@ -206,17 +187,7 @@ def store_turboquant_kv(
     centroids: torch.Tensor,
     midpoints: torch.Tensor,
 ) -> None:
-    """Quantize K and V via TurboQuant_mse and store into combined paged cache.
-
-    Args:
-        key: (N, Hk, D) float16/bfloat16 — raw keys.
-        value: (N, Hk, D) float16/bfloat16 — raw values.
-        kv_cache: (num_blocks, block_size, Hk, slot_size) uint8.
-        slot_mapping: (N,) int32 — per-token cache slot indices.
-        Pi: (D, D) float32 — random rotation matrix.
-        centroids: (n_centroids,) float32 — Lloyd-Max centroids.
-        midpoints: (n_centroids-1,) float32 — decision boundaries.
-    """
+    """Quantize K and V via TurboQuant_mse and store into combined paged cache."""
     N, Hk, D = key.shape
     block_size = kv_cache.shape[1]
     device = key.device
@@ -246,32 +217,27 @@ def store_turboquant_kv(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Dequant: Algorithm 1 DeQuant_mse for both K and V
+# Dequant: Algorithm 1 DeQuant_mse for both K and V (optimized)
 # ═══════════════════════════════════════════════════════════════════════
 
 
 def _dequant_single_vector(
     slot_flat: torch.Tensor,
-    Pi: torch.Tensor,
-    centroids: torch.Tensor,
+    pi_centroids: torch.Tensor,
     D: int,
     offset: int,
 ) -> torch.Tensor:
-    """Dequant a batch of vectors using TurboQuant_mse DeQuant (Algorithm 1).
+    """Dequant a batch of vectors using pre-rotated centroids.
+
+    Optimized: pi_centroids = centroids @ Pi (precomputed once).
+    Dequant is pure gather — no matmul.
 
     Paper Algorithm 1 DeQuant:
       ỹ_j ← c_{idx_j}     (centroid lookup)
       x̂ ← Π^T · ỹ         (inverse rotation)
 
-    Args:
-        slot_flat: (M, slot_size) int32 — raw slot bytes.
-        Pi: (D, D) float32 — random rotation matrix.
-        centroids: (n_centroids,) float32.
-        D: head dimension.
-        offset: byte offset of this vector's data within the slot.
-
-    Returns:
-        x_hat: (M, D) float32 — reconstructed vectors.
+    With precomputation:
+      x̂_unit = (centroids @ Π)[idx]  = pi_centroids[idx]  (gather only)
     """
     mse_bytes = math.ceil(D * MSE_BITS / 8)
 
@@ -284,15 +250,13 @@ def _dequant_single_vector(
     # ── Unpack vec_norm (fp16) ─────────────────────────────────────
     base += mse_bytes
     norm_bytes = slot_flat[:, base : base + 2].to(torch.uint8)
-    vec_norm = bytes_to_fp16(norm_bytes).float()  # (M,)
+    vec_norm = bytes_to_fp16(norm_bytes)  # (M,) float16
 
-    # ── MSE dequant: x̂ = Π^T · centroids[idx] ─────────────────────
-    # Paper line 9-10: ỹ_j ← c_{idx_j}, x̂ ← Π^T · ỹ
-    c = centroids[indices]  # (M, D)
-    x_hat_unit = c @ Pi  # (M, D) — Π^T · c per row
+    # ── Gather pre-rotated centroids (no matmul!) ──────────────────
+    x_hat_unit = pi_centroids[indices]  # (M, D) float16 — pure gather
 
     # ── Rescale by ||x|| ───────────────────────────────────────────
-    x_hat = x_hat_unit * vec_norm.unsqueeze(-1)  # (M, D)
+    x_hat = x_hat_unit * vec_norm.unsqueeze(-1)  # (M, D) float16
 
     return x_hat
 
@@ -301,45 +265,39 @@ def dequant_paged_kv(
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    Pi: torch.Tensor,
-    centroids: torch.Tensor,
+    pi_centroids: torch.Tensor,
     k_buf: torch.Tensor | None = None,
     v_buf: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Full dequant of paged TQ cache to float16 K/V buffers.
+    """Full dequant of paged TQ cache to float16 K/V buffers (optimized).
 
-    Args:
-        kv_cache: (num_blocks, block_size, Hk, slot_size) uint8.
-        block_table: (B, max_num_blocks) int32.
-        seq_lens: (B,) int32.
-        Pi: (D, D) float32 — random rotation matrix.
-        centroids: (n_centroids,) float32.
-        k_buf, v_buf: optional pre-allocated (B, Hk, alloc_len, D) float16.
-
-    Returns:
-        k_buf, v_buf: (B, Hk, alloc_len, D) float16.
-        alloc_len: int.
+    Key optimizations:
+    1. Uses pre-rotated centroids (pi_centroids) — no D×D matmul during dequant
+    2. Buffer reuse with >= check + slice — no realloc when B shrinks
+    3. Direct float16 output — no intermediate float32
     """
     B = block_table.shape[0]
     Hk = kv_cache.shape[2]
-    D = Pi.shape[0]
+    D = pi_centroids.shape[1]
     block_size = kv_cache.shape[1]
     device = kv_cache.device
 
     max_seq_len = int(seq_lens.max().item())
     alloc_len = math.ceil(max_seq_len / block_size) * block_size
 
+    # Buffer reuse: only realloc if too small (>= check, slice handles shrink)
     if k_buf is None or k_buf.shape[0] < B or k_buf.shape[2] < alloc_len:
         k_buf = torch.empty(B, Hk, alloc_len, D, dtype=torch.float16, device=device)
     if v_buf is None or v_buf.shape[0] < B or v_buf.shape[2] < alloc_len:
         v_buf = torch.empty(B, Hk, alloc_len, D, dtype=torch.float16, device=device)
 
-    # Slice to current B (buffer may be larger — allocated at max_num_seqs)
+    # Slice to current B (buffer may be larger — zero-cost view)
     k_buf = k_buf[:B, :, :alloc_len, :]
     v_buf = v_buf[:B, :, :alloc_len, :]
 
     mse_bytes = math.ceil(D * MSE_BITS / 8)
     per_vector = mse_bytes + 2
+    slot_size = kv_cache.shape[3]
 
     # Gather slot data: (B, alloc_len, Hk, slot_size)
     pos = torch.arange(alloc_len, device=device).unsqueeze(0).expand(B, -1)
@@ -349,14 +307,26 @@ def dequant_paged_kv(
     block_nums = block_table.gather(1, page_idx.clamp(max=max_page))
 
     slot_data = kv_cache[block_nums.long(), page_off.long()]
-    slot_flat = slot_data.reshape(-1, kv_cache.shape[3]).to(torch.int32)
+    # Flatten to (B * alloc_len * Hk, slot_size) for batch dequant
+    slot_flat = slot_data.reshape(-1, slot_size)
 
-    # Dequant K (offset 0) and V (offset per_vector)
-    k_recon = _dequant_single_vector(slot_flat, Pi, centroids, D, offset=0)
-    v_recon = _dequant_single_vector(slot_flat, Pi, centroids, D, offset=per_vector)
+    # ── Dequant K (offset 0) ───────────────────────────────────────
+    packed_mse_k = slot_flat[:, :mse_bytes].to(torch.uint8)
+    indices_k = unpack_4bit(packed_mse_k, D)  # (M, D) int32
+    norm_bytes_k = slot_flat[:, mse_bytes : mse_bytes + 2].to(torch.uint8)
+    vec_norm_k = bytes_to_fp16(norm_bytes_k)  # (M,) float16
+    k_recon = pi_centroids[indices_k] * vec_norm_k.unsqueeze(-1)  # (M, D) float16
+
+    # ── Dequant V (offset per_vector) ──────────────────────────────
+    v_start = per_vector
+    packed_mse_v = slot_flat[:, v_start : v_start + mse_bytes].to(torch.uint8)
+    indices_v = unpack_4bit(packed_mse_v, D)  # (M, D) int32
+    norm_bytes_v = slot_flat[:, v_start + mse_bytes : v_start + mse_bytes + 2].to(torch.uint8)
+    vec_norm_v = bytes_to_fp16(norm_bytes_v)  # (M,) float16
+    v_recon = pi_centroids[indices_v] * vec_norm_v.unsqueeze(-1)  # (M, D) float16
 
     # Reshape: (B, alloc_len, Hk, D) -> (B, Hk, alloc_len, D)
-    k_buf[:] = k_recon.to(torch.float16).reshape(B, alloc_len, Hk, D).permute(0, 2, 1, 3)
-    v_buf[:] = v_recon.to(torch.float16).reshape(B, alloc_len, Hk, D).permute(0, 2, 1, 3)
+    k_buf[:] = k_recon.reshape(B, alloc_len, Hk, D).permute(0, 2, 1, 3)
+    v_buf[:] = v_recon.reshape(B, alloc_len, Hk, D).permute(0, 2, 1, 3)
 
     return k_buf, v_buf, alloc_len

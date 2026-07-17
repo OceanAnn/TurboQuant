@@ -43,6 +43,7 @@ from vllm_ascend.attention.attention_v1 import (
 from vllm_ascend.quantization.methods.turboquant_ops import (
     build_random_rotation,
     compute_midpoints,
+    compute_pi_centroids,
     dequant_paged_kv,
     store_turboquant_kv,
 )
@@ -118,6 +119,11 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             # Compute midpoints from centroids
             c = layer._tq_centroids.to(device=device, dtype=torch.float32)
             layer._tq_midpoints = compute_midpoints(c)
+
+            # Precompute inverse-rotated centroids: pi_centroids = centroids @ Pi
+            # This eliminates the D×D matmul during dequant — dequant becomes pure gather
+            layer._tq_pi_centroids = compute_pi_centroids(c, layer._tq_Pi)
+
             layer._tq_cached = True
 
     @staticmethod
@@ -267,8 +273,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             kv_cache=tq_cache,
             block_table=attn_metadata.block_tables,
             seq_lens=attn_metadata.seq_lens,
-            Pi=layer._tq_Pi,
-            centroids=layer._tq_centroids,
+            pi_centroids=layer._tq_pi_centroids,
             k_buf=getattr(layer, "_tq_k_dequant_buf", None),
             v_buf=getattr(layer, "_tq_v_dequant_buf", None),
         )
